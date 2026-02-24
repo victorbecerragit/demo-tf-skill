@@ -60,13 +60,9 @@ jobs:
         with:
           tflint_version: ${{ env.TFLINT_VERSION }}
 
-      - name: Initialize TFLint
-        working-directory: ${{ matrix.terraform-examples }}
-        run: tflint --init
-
       - name: Run TFLint
         working-directory: ${{ matrix.terraform-examples }}
-        run: tflint --format compact
+        run: tflint --config ${{ github.workspace }}/.tflint.hcl --format compact
 
   # Stage 2: Security Scanning
   security:
