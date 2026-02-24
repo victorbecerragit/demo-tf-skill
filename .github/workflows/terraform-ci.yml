@@ -22,7 +22,7 @@ on:
 
 env:
   TF_VERSION: "1.6.4"
-  TFLINT_VERSION: "0.50.3"
+  TFLINT_VERSION: "0.61.0"
 
 jobs:
   # Stage 1: Validate & Lint
@@ -57,7 +57,13 @@ jobs:
 
       - name: Install TFLint
         run: |
-          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+          # Download latest TFLint release directly
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/terraform-linters/tflint/releases/latest | grep "browser_download_url.*linux_amd64.zip" | head -1 | cut -d'"' -f4)
+          echo "Downloading TFLint from: $DOWNLOAD_URL"
+          wget -q "$DOWNLOAD_URL" -O tflint.zip
+          unzip -q tflint.zip
+          sudo mv tflint /usr/local/bin/
+          rm tflint.zip
           tflint --version
 
       - name: Initialize TFLint Plugins
