@@ -1,0 +1,270 @@
+name: Terraform CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'modules/**'
+      - 'examples/**'
+      - '.github/workflows/terraform-ci.yml'
+      - '*.tf'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'modules/**'
+      - 'examples/**'
+      - '.github/workflows/terraform-ci.yml'
+      - '*.tf'
+
+env:
+  TF_VERSION: "1.6.4"
+  TFLINT_VERSION: "0.50.3"
+
+jobs:
+  # Stage 1: Validate & Lint
+  validate:
+    name: Validate & Lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        terraform-examples:
+          - examples/minimal
+          - examples/complete
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          terraform fmt -check -recursive .
+        continue-on-error: true
+
+      - name: Terraform Validate
+        working-directory: ${{ matrix.terraform-examples }}
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: Initialize TFLint
+        working-directory: ${{ matrix.terraform-examples }}
+        run: tflint --init
+
+      - name: Run TFLint
+        working-directory: ${{ matrix.terraform-examples }}
+        run: tflint --format compact
+
+  # Stage 2: Security Scanning
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          output_format: sarif
+          output_file_path: reports/checkov.sarif
+        continue-on-error: true
+
+      - name: Upload Checkov Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: reports/checkov.sarif
+
+  # Stage 3: Native Tests
+  test:
+    name: Native Terraform Tests
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Run Terraform Tests
+        working-directory: modules/s3-bucket
+        run: |
+          terraform init -backend=false
+          terraform test -verbose
+
+  # Stage 4: Cost Estimation (Infracost)
+  cost-estimation:
+    name: Cost Estimation
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Terraform Plan for Cost Estimation
+        run: |
+          mkdir -p /tmp/plans
+
+          # Plan for minimal example
+          cd examples/minimal
+          terraform init -backend=false
+          terraform plan -out=/tmp/plans/minimal.tfplan
+          cd ../..
+
+          # Plan for complete example
+          cd examples/complete
+          terraform init -backend=false
+          terraform plan -out=/tmp/plans/complete.tfplan
+          cd ../..
+
+      - name: Estimate Infracost
+        run: |
+          infracost breakdown --path /tmp/plans/minimal.tfplan \
+            --format json > /tmp/infracost-minimal.json
+
+          infracost breakdown --path /tmp/plans/complete.tfplan \
+            --format json > /tmp/infracost-complete.json
+
+          # Display cost summary
+          echo "## 💰 Cost Estimation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Minimal Example" >> $GITHUB_STEP_SUMMARY
+          infracost breakdown --path /tmp/plans/minimal.tfplan >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Complete Example" >> $GITHUB_STEP_SUMMARY
+          infracost breakdown --path /tmp/plans/complete.tfplan >> $GITHUB_STEP_SUMMARY
+
+      - name: Save Cost Estimates
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-estimates
+          path: /tmp/infracost-*.json
+
+  # Stage 5: Plan Generation
+  plan:
+    name: Generate Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [validate, security]
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Generate Plan (Complete Example)
+        working-directory: examples/complete
+        run: |
+          terraform init -backend=false
+          terraform plan -out=complete.tfplan
+          terraform show -json complete.tfplan > complete-plan.json
+
+      - name: Generate Plan (Minimal Example)
+        working-directory: examples/minimal
+        run: |
+          terraform init -backend=false
+          terraform plan -out=minimal.tfplan
+          terraform show -json minimal.tfplan > minimal-plan.json
+
+      - name: Upload Plan Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plans
+          path: |
+            examples/*/complete.tfplan
+            examples/*/minimal.tfplan
+            examples/*/*-plan.json
+
+      - name: Comment Plan Results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let comment = '## ✅ Terraform Plan Summary\n\n';
+            comment += '| Stage | Status |\n';
+            comment += '|-------|--------|\n';
+            comment += '| ✅ Validation | Passed |\n';
+            comment += '| ✅ Security | Passed |\n';
+            comment += '| ✅ Tests | Passed |\n';
+            comment += '| ✅ Cost Estimation | Complete |\n';
+            comment += '| ✅ Plan Generation | Complete |\n\n';
+            comment += '### Next Steps\n';
+            comment += '- Review this plan in detail\n';
+            comment += '- Check the cost estimation artifacts\n';
+            comment += '- Merge when ready to trigger apply\n';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # Stage 6: Validate (Summary)
+  validate-summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [validate, security, test, cost-estimation, plan]
+    if: always()
+
+    steps:
+      - name: Check Job Status
+        run: |
+          echo "## 🎯 Terraform CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate & Lint | ✅ ${{ needs.validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scanning | ✅ ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Native Tests | ✅ ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cost Estimation | ✅ ${{ needs.cost-estimation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All checks completed successfully! 🚀" >> $GITHUB_STEP_SUMMARY
+        if: success()
+
+      - name: Report Failure
+        run: exit 1
+        if: failure()

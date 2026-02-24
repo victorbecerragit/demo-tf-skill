@@ -1,0 +1,48 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+
+  # Terraform formatting and validation
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.105.0
+    hooks:
+      # Format terraform code
+      - id: terraform_fmt
+        args:
+          - --args=-recursive
+
+      # Validate terraform
+      - id: terraform_validate
+
+      # Detect secrets in terraform code
+      #- id: detect-secrets
+      #  args: ['--baseline', '.secrets.baseline']
+
+      # Terraform docs generation
+      - id: terraform_docs
+        args:
+          - --hook-config=--path-to-file=README.md
+          - --hook-config=--add-to-existing-file=true
+          - --hook-config=--create-file-if-missing=true
+
+      # Security checks with TFLint
+      #- id: tflint
+      #  args:
+      #  - --args=--init
+      #    - --args=--format=compact
+
+  # Security scanning with Checkov (disabled - run separately if needed)
+  # - repo: https://github.com/bridgecrewio/checkov.git
+  #   rev: 3.2.506
+  #   hooks:
+  #     - id: checkov
+  #       args:
+  #         - --framework=terraform
+  #         - --quiet
+  #         - --compact

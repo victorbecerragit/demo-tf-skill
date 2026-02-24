@@ -1,0 +1,13 @@
+# Infracost Configuration
+# Cost estimation tool for infrastructure-as-code
+
+version: 0.1
+terraform_dir: .
+format: table
+
+# Define what resources to estimate
+projects:
+  - path: examples/minimal
+    name: Minimal Example
+  - path: examples/complete
+    name: Complete Example (Production)
