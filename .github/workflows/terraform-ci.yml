@@ -141,6 +141,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
       - name: Run Infracost
         uses: infracost/actions/setup@v2
         with:
@@ -154,30 +159,42 @@ jobs:
           cd examples/minimal
           terraform init -backend=false
           terraform plan -out=/tmp/plans/minimal.tfplan
+          terraform show -json /tmp/plans/minimal.tfplan > /tmp/plans/minimal.json
           cd ../..
 
           # Plan for complete example
           cd examples/complete
           terraform init -backend=false
           terraform plan -out=/tmp/plans/complete.tfplan
+          terraform show -json /tmp/plans/complete.tfplan > /tmp/plans/complete.json
           cd ../..
 
       - name: Estimate Infracost
         run: |
-          infracost breakdown --path /tmp/plans/minimal.tfplan \
+          cd examples/minimal
+          infracost breakdown --path /tmp/plans/minimal.json \
             --format json > /tmp/infracost-minimal.json
+          cd ../..
 
-          infracost breakdown --path /tmp/plans/complete.tfplan \
+          cd examples/complete
+          infracost breakdown --path /tmp/plans/complete.json \
             --format json > /tmp/infracost-complete.json
+          cd ../..
 
           # Display cost summary
           echo "## 💰 Cost Estimation Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Minimal Example" >> $GITHUB_STEP_SUMMARY
-          infracost breakdown --path /tmp/plans/minimal.tfplan >> $GITHUB_STEP_SUMMARY
+
+          cd examples/minimal
+          infracost breakdown --path /tmp/plans/minimal.json >> $GITHUB_STEP_SUMMARY
+          cd ../..
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Complete Example" >> $GITHUB_STEP_SUMMARY
-          infracost breakdown --path /tmp/plans/complete.tfplan >> $GITHUB_STEP_SUMMARY
+
+          cd examples/complete
+          infracost breakdown --path /tmp/plans/complete.json >> $GITHUB_STEP_SUMMARY
+          cd ../..
 
       - name: Save Cost Estimates
         uses: actions/upload-artifact@v4
