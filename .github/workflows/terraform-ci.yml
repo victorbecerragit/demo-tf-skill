@@ -44,6 +44,8 @@ env:
 permissions:
   id-token: write
   contents: read
+  pull-requests: write
+  issues: write
   security-events: write
 
 jobs:
@@ -198,6 +200,14 @@ jobs:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Validate Infracost API Key
+        run: |
+          if [ -z "${{ secrets.INFRACOST_API_KEY }}" ]; then
+            echo "INFRACOST_API_KEY secret is missing."
+            exit 1
+          fi
+          echo "INFRACOST_API_KEY is configured."
+
       - name: Run Infracost
         uses: infracost/actions/setup@v2
         with:
@@ -337,12 +347,11 @@ jobs:
             examples/*/*-plan.json
 
       - name: Comment Plan Results
-        if: always()
+        if: ${{ always() && github.event.pull_request.head.repo.full_name == github.repository }}
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-
             let comment = '## ✅ Terraform Plan Summary\n\n';
             comment += '| Stage | Status |\n';
             comment += '|-------|--------|\n';
@@ -358,12 +367,16 @@ jobs:
             comment += '- Configure required reviewers on the production environment in repository settings\n';
             comment += '- Default Terraform state values are built in and can be overridden with repository variables\n';
 
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              core.warning(`Skipping PR comment: ${error.message}`);
+            }
 
   # Stage 6: Protected Apply
   deploy:
