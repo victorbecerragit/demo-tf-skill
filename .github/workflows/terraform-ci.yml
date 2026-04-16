@@ -32,7 +32,7 @@ on:
 
 env:
   TF_VERSION: "1.6.4"
-  TFLINT_VERSION: "0.61.0"
+  TFLINT_VERSION: "v0.61.0"
   AWS_REGION: "us-east-1"
   DEFAULT_TF_STATE_BUCKET: "tf-state-200227355781-us-east-1"
   DEFAULT_TF_STATE_KEY: "test-tf-skill/demo-poc/terraform.tfstate"
@@ -76,20 +76,17 @@ jobs:
           terraform init -backend=false
           terraform validate
 
-      - name: Install TFLint
-        run: |
-          # Download latest TFLint release directly
-          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/terraform-linters/tflint/releases/latest | grep "browser_download_url.*linux_amd64.zip" | head -1 | cut -d'"' -f4)
-          echo "Downloading TFLint from: $DOWNLOAD_URL"
-          wget -q "$DOWNLOAD_URL" -O tflint.zip
-          unzip -q tflint.zip
-          sudo mv tflint /usr/local/bin/
-          rm tflint.zip
-          tflint --version
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
 
       - name: Initialize TFLint Plugins
-        run: tflint --init
-        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init
+          tflint --version
 
       - name: Run TFLint
         working-directory: ${{ matrix.terraform-examples }}
