@@ -19,12 +19,30 @@ on:
       - 'examples/**'
       - '.github/workflows/terraform-ci.yml'
       - '*.tf'
+  workflow_dispatch:
+    inputs:
+      bucket_prefix:
+        description: 'Bucket prefix for deployment'
+        required: false
+        default: 'demo-poc'
+      environment:
+        description: 'Environment tag for deployment'
+        required: false
+        default: 'dev'
 
 env:
   TF_VERSION: "1.6.4"
   TFLINT_VERSION: "0.61.0"
+  AWS_REGION: "us-east-1"
+  DEFAULT_TF_STATE_BUCKET: "tf-state-200227355781-us-east-1"
+  DEFAULT_TF_STATE_KEY: "test-tf-skill/demo-poc/terraform.tfstate"
+  DEFAULT_TF_STATE_REGION: "us-east-1"
+  DEFAULT_TF_LOCK_TABLE: "terraform-locks"
+  DEFAULT_BUCKET_PREFIX: "demo-poc"
+  DEFAULT_DEPLOY_ENVIRONMENT: "dev"
 
 permissions:
+  id-token: write
   contents: read
   security-events: write
 
@@ -51,7 +69,6 @@ jobs:
       - name: Terraform Format Check
         run: |
           terraform fmt -check -recursive .
-        continue-on-error: true
 
       - name: Terraform Validate
         working-directory: ${{ matrix.terraform-examples }}
@@ -77,7 +94,6 @@ jobs:
       - name: Run TFLint
         working-directory: ${{ matrix.terraform-examples }}
         run: tflint --chdir . --config ${{ github.workspace }}/.tflint.hcl --format compact
-        continue-on-error: true
 
   # Stage 2: Security Scanning
   security:
@@ -161,6 +177,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-1
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -169,6 +186,20 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Validate AWS Credentials Configuration
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ] && { [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; }; then
+            echo "Either AWS_ROLE_ARN (preferred) or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY secrets must be configured."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ env.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Run Infracost
         uses: infracost/actions/setup@v2
@@ -232,6 +263,15 @@ jobs:
     runs-on: ubuntu-latest
     needs: [validate, security]
     if: github.event_name == 'pull_request'
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'tf-state-200227355781-us-east-1' }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'test-tf-skill/demo-poc/terraform.tfstate' }}
+      TF_STATE_REGION: ${{ vars.TF_STATE_REGION || 'us-east-1' }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE || 'terraform-locks' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -241,17 +281,52 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Validate AWS Credentials Configuration
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ] && { [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; }; then
+            echo "Either AWS_ROLE_ARN (preferred) or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY secrets must be configured."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ env.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare Terraform Backend Configuration
+        run: |
+          {
+            echo "bucket = \"$TF_STATE_BUCKET\""
+            echo "key = \"$TF_STATE_KEY\""
+            echo "region = \"$TF_STATE_REGION\""
+            echo 'encrypt = true'
+          } > /tmp/backend.hcl
+
+          if [ -n "$TF_LOCK_TABLE" ]; then
+            echo "dynamodb_table = \"$TF_LOCK_TABLE\"" >> /tmp/backend.hcl
+          fi
+
       - name: Generate Plan (Complete Example)
         working-directory: examples/complete
         run: |
-          terraform init -backend=false
+          if [ -f /tmp/backend.hcl ]; then
+            terraform init -backend-config=/tmp/backend.hcl
+          else
+            terraform init -backend=false
+          fi
           terraform plan -out=complete.tfplan
           terraform show -json complete.tfplan > complete-plan.json
 
       - name: Generate Plan (Minimal Example)
         working-directory: examples/minimal
         run: |
-          terraform init -backend=false
+          if [ -f /tmp/backend.hcl ]; then
+            terraform init -backend-config=/tmp/backend.hcl
+          else
+            terraform init -backend=false
+          fi
           terraform plan -out=minimal.tfplan
           terraform show -json minimal.tfplan > minimal-plan.json
 
@@ -282,7 +357,9 @@ jobs:
             comment += '### Next Steps\n';
             comment += '- Review this plan in detail\n';
             comment += '- Check the cost estimation artifacts\n';
-            comment += '- Merge when ready to trigger apply\n';
+            comment += '- After approval, merge to main to trigger the protected AWS deployment\n';
+            comment += '- Configure required reviewers on the production environment in repository settings\n';
+            comment += '- Default Terraform state values are built in and can be overridden with repository variables\n';
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -291,28 +368,113 @@ jobs:
               body: comment
             });
 
-  # Stage 6: Validate (Summary)
+  # Stage 6: Protected Apply
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    needs: [validate, security, test, cost-estimation]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    environment: production
+    concurrency:
+      group: terraform-production-deploy
+      cancel-in-progress: false
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'tf-state-200227355781-us-east-1' }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'test-tf-skill/demo-poc/terraform.tfstate' }}
+      TF_STATE_REGION: ${{ vars.TF_STATE_REGION || 'us-east-1' }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE || 'terraform-locks' }}
+      TF_VAR_bucket_prefix: ${{ vars.BUCKET_PREFIX || 'demo-poc' }}
+      TF_VAR_environment: ${{ vars.DEPLOY_ENVIRONMENT || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Validate AWS Credentials Configuration
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ] && { [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; }; then
+            echo "Either AWS_ROLE_ARN (preferred) or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY secrets must be configured."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ env.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare Terraform Backend Configuration
+        run: |
+          {
+            echo "bucket = \"$TF_STATE_BUCKET\""
+            echo "key = \"$TF_STATE_KEY\""
+            echo "region = \"$TF_STATE_REGION\""
+            echo 'encrypt = true'
+          } > /tmp/backend.hcl
+
+          if [ -n "$TF_LOCK_TABLE" ]; then
+            echo "dynamodb_table = \"$TF_LOCK_TABLE\"" >> /tmp/backend.hcl
+          fi
+
+      - name: Terraform Apply (Complete Example)
+        working-directory: examples/complete
+        run: |
+          BUCKET_PREFIX="${TF_VAR_bucket_prefix}"
+          DEPLOY_ENV="${TF_VAR_environment}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BUCKET_PREFIX="${{ github.event.inputs.bucket_prefix }}"
+            DEPLOY_ENV="${{ github.event.inputs.environment }}"
+          fi
+
+          BUCKET_PREFIX="${BUCKET_PREFIX:-demo-poc}"
+          DEPLOY_ENV="${DEPLOY_ENV:-dev}"
+
+          echo "Deploying bucket prefix: $BUCKET_PREFIX"
+          echo "Deploying environment: $DEPLOY_ENV"
+
+          terraform init -backend-config=/tmp/backend.hcl
+          terraform apply -auto-approve \
+            -var="bucket_prefix=$BUCKET_PREFIX" \
+            -var="environment=$DEPLOY_ENV"
+
+      - name: Publish Deployment Summary
+        working-directory: examples/complete
+        run: |
+          echo "## 🚀 Terraform Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+
+  # Stage 7: Validate (Summary)
   validate-summary:
     name: Validation Summary
     runs-on: ubuntu-latest
-    needs: [validate, security, test, cost-estimation, plan]
+    needs: [validate, security, test, cost-estimation, plan, deploy]
     if: always()
 
     steps:
-      - name: Check Job Status
+      - name: Publish Job Status
         run: |
           echo "## 🎯 Terraform CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Validate & Lint | ✅ ${{ needs.validate.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Security Scanning | ✅ ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Native Tests | ✅ ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Cost Estimation | ✅ ${{ needs.cost-estimation.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All checks completed successfully! 🚀" >> $GITHUB_STEP_SUMMARY
-        if: success()
+          echo "| Validate & Lint | ${{ needs.validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scanning | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Native Tests | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cost Estimation | ${{ needs.cost-estimation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Plan | ${{ needs.plan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy | ${{ needs.deploy.result }} |" >> $GITHUB_STEP_SUMMARY
 
-      - name: Report Failure
+      - name: Fail if any required job failed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: exit 1
-        if: failure()
