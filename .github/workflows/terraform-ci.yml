@@ -193,6 +193,10 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-east-1
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'tf-state-200227355781-us-east-1' }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY || 'test-tf-skill/demo-poc/terraform.tfstate' }}
+      TF_STATE_REGION: ${{ vars.TF_STATE_REGION || 'us-east-1' }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE || 'terraform-locks' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -216,6 +220,32 @@ jobs:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Prepare Terraform Backend Configuration
+        shell: bash
+        run: |
+          STATE_KEY_DIR="${TF_STATE_KEY%/*}"
+          if [ -z "$STATE_KEY_DIR" ] || [ "$STATE_KEY_DIR" = "$TF_STATE_KEY" ]; then
+            STATE_KEY_DIR="test-tf-skill/ci"
+          fi
+
+          create_backend_file() {
+            local target_file="$1"
+            local state_key="$2"
+            {
+              echo "bucket = \"$TF_STATE_BUCKET\""
+              echo "key = \"$state_key\""
+              echo "region = \"$TF_STATE_REGION\""
+              echo 'encrypt = true'
+            } > "$target_file"
+
+            if [ -n "$TF_LOCK_TABLE" ]; then
+              echo "dynamodb_table = \"$TF_LOCK_TABLE\"" >> "$target_file"
+            fi
+          }
+
+          create_backend_file /tmp/backend-minimal.hcl "$STATE_KEY_DIR/examples/minimal.tfstate"
+          create_backend_file /tmp/backend-complete.hcl "$STATE_KEY_DIR/examples/complete.tfstate"
+
       - name: Validate Infracost API Key
         run: |
           if [ -z "${{ secrets.INFRACOST_API_KEY }}" ]; then
@@ -230,19 +260,20 @@ jobs:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       - name: Generate Terraform Plan for Cost Estimation
+        shell: bash
         run: |
           mkdir -p /tmp/plans
 
           # Plan for minimal example
           cd examples/minimal
-          terraform init -backend=false
+          terraform init -reconfigure -backend-config=/tmp/backend-minimal.hcl
           terraform plan -out=/tmp/plans/minimal.tfplan
           terraform show -json /tmp/plans/minimal.tfplan > /tmp/plans/minimal.json
           cd ../..
 
           # Plan for complete example
           cd examples/complete
-          terraform init -backend=false
+          terraform init -reconfigure -backend-config=/tmp/backend-complete.hcl
           terraform plan -out=/tmp/plans/complete.tfplan
           terraform show -json /tmp/plans/complete.tfplan > /tmp/plans/complete.json
           cd ../..
@@ -319,37 +350,42 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Prepare Terraform Backend Configuration
+        shell: bash
         run: |
-          {
-            echo "bucket = \"$TF_STATE_BUCKET\""
-            echo "key = \"$TF_STATE_KEY\""
-            echo "region = \"$TF_STATE_REGION\""
-            echo 'encrypt = true'
-          } > /tmp/backend.hcl
-
-          if [ -n "$TF_LOCK_TABLE" ]; then
-            echo "dynamodb_table = \"$TF_LOCK_TABLE\"" >> /tmp/backend.hcl
+          STATE_KEY_DIR="${TF_STATE_KEY%/*}"
+          if [ -z "$STATE_KEY_DIR" ] || [ "$STATE_KEY_DIR" = "$TF_STATE_KEY" ]; then
+            STATE_KEY_DIR="test-tf-skill/ci"
           fi
+
+          create_backend_file() {
+            local target_file="$1"
+            local state_key="$2"
+            {
+              echo "bucket = \"$TF_STATE_BUCKET\""
+              echo "key = \"$state_key\""
+              echo "region = \"$TF_STATE_REGION\""
+              echo 'encrypt = true'
+            } > "$target_file"
+
+            if [ -n "$TF_LOCK_TABLE" ]; then
+              echo "dynamodb_table = \"$TF_LOCK_TABLE\"" >> "$target_file"
+            fi
+          }
+
+          create_backend_file /tmp/backend-minimal.hcl "$STATE_KEY_DIR/examples/minimal.tfstate"
+          create_backend_file /tmp/backend-complete.hcl "$STATE_KEY_DIR/examples/complete.tfstate"
 
       - name: Generate Plan (Complete Example)
         working-directory: examples/complete
         run: |
-          if [ -f /tmp/backend.hcl ]; then
-            terraform init -backend-config=/tmp/backend.hcl
-          else
-            terraform init -backend=false
-          fi
+          terraform init -reconfigure -backend-config=/tmp/backend-complete.hcl
           terraform plan -out=complete.tfplan
           terraform show -json complete.tfplan > complete-plan.json
 
       - name: Generate Plan (Minimal Example)
         working-directory: examples/minimal
         run: |
-          if [ -f /tmp/backend.hcl ]; then
-            terraform init -backend-config=/tmp/backend.hcl
-          else
-            terraform init -backend=false
-          fi
+          terraform init -reconfigure -backend-config=/tmp/backend-minimal.hcl
           terraform plan -out=minimal.tfplan
           terraform show -json minimal.tfplan > minimal-plan.json
 
