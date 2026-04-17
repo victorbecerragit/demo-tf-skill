@@ -139,13 +139,22 @@ infracost breakdown --path tfplan
    - Go to repository → Settings → Actions → General
    - Select "Allow all actions and reusable workflows"
 
-3. **Configure Secrets (Optional - for Infracost)**
+3. **Configure Secrets and Repository Variables**
    - Go to Settings → Secrets and variables → Actions
-   - Create `INFRACOST_API_KEY` (get free key at infracost.io)
+   - Secrets:
+     - `AWS_ROLE_ARN` preferred for OIDC auth, or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+     - `INFRACOST_API_KEY` for cost breakdowns
+   - Variables:
+     - `TF_STATE_BUCKET` for the remote Terraform state bucket
+     - `TF_STATE_REGION` for the backend region
+     - `TF_LOCK_TABLE` if you use DynamoDB locking
+     - Optional: `BUCKET_PREFIX`, `DEPLOY_ENVIRONMENT`
 
 4. **Feature enabled!**
    - CI pipeline now runs on every push and PR
-   - Check Actions tab to see pipeline results
+   - Push to `main` deploys the complete example
+   - Manual workflow dispatch now supports both `apply` and `destroy`
+   - Check the Actions tab to review or tear down a deployment safely
 
 ## 📋 Testing Strategy
 
