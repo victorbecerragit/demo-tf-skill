@@ -499,9 +499,12 @@ jobs:
             FORCE_DESTROY="true"
           fi
 
+          LEGACY_STATE_KEY="test-tf-skill/${BUCKET_PREFIX}/terraform.tfstate"
+          ENV_STATE_KEY="test-tf-skill/${BUCKET_PREFIX}/${DEPLOY_ENV}/terraform.tfstate"
+
           TF_STATE_KEY_EFFECTIVE="$TF_STATE_KEY"
           if [ -z "$TF_STATE_KEY_EFFECTIVE" ] || [ "$TF_STATE_KEY_EFFECTIVE" = "test-tf-skill/demo-poc/terraform.tfstate" ]; then
-            TF_STATE_KEY_EFFECTIVE="test-tf-skill/${BUCKET_PREFIX}/${DEPLOY_ENV}/terraform.tfstate"
+            TF_STATE_KEY_EFFECTIVE="$LEGACY_STATE_KEY"
           fi
 
           echo "operation=$OPERATION" >> "$GITHUB_OUTPUT"
@@ -509,12 +512,36 @@ jobs:
           echo "deploy_environment=$DEPLOY_ENV" >> "$GITHUB_OUTPUT"
           echo "force_destroy=$FORCE_DESTROY" >> "$GITHUB_OUTPUT"
           echo "tf_state_key=$TF_STATE_KEY_EFFECTIVE" >> "$GITHUB_OUTPUT"
+          echo "legacy_state_key=$LEGACY_STATE_KEY" >> "$GITHUB_OUTPUT"
+          echo "env_state_key=$ENV_STATE_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Detect Active Terraform State Key
+        id: statekey
+        shell: bash
+        run: |
+          SELECTED_KEY="${{ steps.resolve.outputs.tf_state_key }}"
+          DETECTION_SOURCE="configured"
+
+          state_exists() {
+            aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "$1" >/dev/null 2>&1
+          }
+
+          if state_exists "${{ steps.resolve.outputs.env_state_key }}"; then
+            SELECTED_KEY="${{ steps.resolve.outputs.env_state_key }}"
+            DETECTION_SOURCE="environment"
+          elif state_exists "${{ steps.resolve.outputs.legacy_state_key }}"; then
+            SELECTED_KEY="${{ steps.resolve.outputs.legacy_state_key }}"
+            DETECTION_SOURCE="legacy"
+          fi
+
+          echo "selected_key=$SELECTED_KEY" >> "$GITHUB_OUTPUT"
+          echo "detection_source=$DETECTION_SOURCE" >> "$GITHUB_OUTPUT"
 
       - name: Prepare Terraform Backend Configuration
         run: |
           {
             echo "bucket = \"$TF_STATE_BUCKET\""
-            echo "key = \"${{ steps.resolve.outputs.tf_state_key }}\""
+            echo "key = \"${{ steps.statekey.outputs.selected_key }}\""
             echo "region = \"$TF_STATE_REGION\""
             echo 'encrypt = true'
           } > /tmp/backend.hcl
@@ -569,7 +596,8 @@ jobs:
           echo "Terraform action: ${{ steps.resolve.outputs.operation }}"
           echo "Bucket prefix: ${{ steps.resolve.outputs.bucket_prefix }}"
           echo "Environment: ${{ steps.resolve.outputs.deploy_environment }}"
-          echo "State key: ${{ steps.resolve.outputs.tf_state_key }}"
+          echo "State key: ${{ steps.statekey.outputs.selected_key }}"
+          echo "State source: ${{ steps.statekey.outputs.detection_source }}"
           echo "Force destroy: ${{ steps.resolve.outputs.force_destroy }}"
 
           terraform init -reconfigure -backend-config=/tmp/backend.hcl
@@ -595,7 +623,8 @@ jobs:
           echo "- Action: ${{ steps.resolve.outputs.operation }}" >> $GITHUB_STEP_SUMMARY
           echo "- Bucket prefix: ${{ steps.resolve.outputs.bucket_prefix }}" >> $GITHUB_STEP_SUMMARY
           echo "- Environment: ${{ steps.resolve.outputs.deploy_environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "- State key: ${{ steps.resolve.outputs.tf_state_key }}" >> $GITHUB_STEP_SUMMARY
+          echo "- State key: ${{ steps.statekey.outputs.selected_key }}" >> $GITHUB_STEP_SUMMARY
+          echo "- State source: ${{ steps.statekey.outputs.detection_source }}" >> $GITHUB_STEP_SUMMARY
           echo "- Force destroy: ${{ steps.resolve.outputs.force_destroy }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
