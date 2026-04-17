@@ -487,7 +487,46 @@ jobs:
             echo "dynamodb_table = \"$TF_LOCK_TABLE\"" >> /tmp/backend.hcl
           fi
 
+      - name: Detect Existing Deployment Artifacts
+        id: precheck
+        if: ${{ steps.resolve.outputs.operation == 'apply' }}
+        working-directory: examples/complete
+        shell: bash
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          APP_BUCKET="${{ steps.resolve.outputs.bucket_prefix }}-app-${ACCOUNT_ID}"
+          LOGS_BUCKET="${{ steps.resolve.outputs.bucket_prefix }}-logs-${ACCOUNT_ID}"
+
+          echo "app_bucket=$APP_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "logs_bucket=$LOGS_BUCKET" >> "$GITHUB_OUTPUT"
+
+          terraform init -reconfigure -backend-config=/tmp/backend.hcl >/dev/null
+
+          STATE_HAS_BUCKETS="false"
+          if terraform state list 2>/dev/null | grep -q 'module\.s3_bucket_application\.aws_s3_bucket\.this'; then
+            STATE_HAS_BUCKETS="true"
+          fi
+
+          EXISTING_BUCKETS="false"
+          if aws s3api head-bucket --bucket "$APP_BUCKET" 2>/dev/null; then
+            EXISTING_BUCKETS="true"
+          fi
+          if aws s3api head-bucket --bucket "$LOGS_BUCKET" 2>/dev/null; then
+            EXISTING_BUCKETS="true"
+          fi
+
+          SKIP_APPLY="false"
+          if [ "$EXISTING_BUCKETS" = "true" ] && [ "$STATE_HAS_BUCKETS" != "true" ]; then
+            SKIP_APPLY="true"
+            echo "Matching S3 buckets already exist outside Terraform state; apply will be skipped."
+          fi
+
+          echo "state_has_buckets=$STATE_HAS_BUCKETS" >> "$GITHUB_OUTPUT"
+          echo "existing_buckets=$EXISTING_BUCKETS" >> "$GITHUB_OUTPUT"
+          echo "skip_apply=$SKIP_APPLY" >> "$GITHUB_OUTPUT"
+
       - name: Terraform Apply or Destroy (Complete Example)
+        if: ${{ steps.resolve.outputs.operation == 'destroy' || steps.precheck.outputs.skip_apply != 'true' }}
         working-directory: examples/complete
         shell: bash
         run: |
@@ -524,9 +563,12 @@ jobs:
           echo "- Force destroy: ${{ steps.resolve.outputs.force_destroy }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ steps.resolve.outputs.operation }}" = "destroy" ]; then
+          if [ "${{ steps.precheck.outputs.skip_apply }}" = "true" ]; then
+            echo "Apply skipped because matching S3 buckets already exist from a previous deployment outside the current Terraform state." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.resolve.outputs.operation }}" = "destroy" ]; then
             echo "Infrastructure destroy completed." >> $GITHUB_STEP_SUMMARY
           else
+            terraform init -reconfigure -backend-config=/tmp/backend.hcl >/dev/null
             terraform output >> $GITHUB_STEP_SUMMARY
           fi
 
