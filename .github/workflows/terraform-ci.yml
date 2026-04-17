@@ -537,22 +537,16 @@ jobs:
           echo "selected_key=$SELECTED_KEY" >> "$GITHUB_OUTPUT"
           echo "detection_source=$DETECTION_SOURCE" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare Terraform Backend Configuration
+      - name: Export Active Terraform Backend Settings
+        shell: bash
         run: |
-          {
-            echo "bucket = \"$TF_STATE_BUCKET\""
-            echo "key = \"${{ steps.statekey.outputs.selected_key }}\""
-            echo "region = \"$TF_STATE_REGION\""
-            echo 'encrypt = true'
-          } > /tmp/backend.hcl
-
-          if [ -n "$TF_LOCK_TABLE" ]; then
-            echo "dynamodb_table = \"$TF_LOCK_TABLE\"" >> /tmp/backend.hcl
-          fi
+          echo "TF_BACKEND_BUCKET=$TF_STATE_BUCKET" >> "$GITHUB_ENV"
+          echo "TF_BACKEND_KEY=${{ steps.statekey.outputs.selected_key }}" >> "$GITHUB_ENV"
+          echo "TF_BACKEND_REGION=$TF_STATE_REGION" >> "$GITHUB_ENV"
+          echo "TF_BACKEND_LOCK_TABLE=$TF_LOCK_TABLE" >> "$GITHUB_ENV"
 
       - name: Detect Existing Deployment Artifacts
         id: precheck
-        if: ${{ steps.resolve.outputs.operation == 'apply' }}
         working-directory: examples/complete
         shell: bash
         run: |
@@ -563,10 +557,21 @@ jobs:
           echo "app_bucket=$APP_BUCKET" >> "$GITHUB_OUTPUT"
           echo "logs_bucket=$LOGS_BUCKET" >> "$GITHUB_OUTPUT"
 
-          terraform init -reconfigure -backend-config=/tmp/backend.hcl >/dev/null
+          INIT_ARGS=(
+            -reconfigure
+            "-backend-config=bucket=$TF_BACKEND_BUCKET"
+            "-backend-config=key=$TF_BACKEND_KEY"
+            "-backend-config=region=$TF_BACKEND_REGION"
+          )
+
+          if [ -n "$TF_BACKEND_LOCK_TABLE" ]; then
+            INIT_ARGS+=("-backend-config=dynamodb_table=$TF_BACKEND_LOCK_TABLE")
+          fi
+
+          terraform init "${INIT_ARGS[@]}" >/dev/null
 
           STATE_HAS_BUCKETS="false"
-          if terraform state list 2>/dev/null | grep -q 'module\.s3_bucket_application\.aws_s3_bucket\.this'; then
+          if terraform state list 2>/dev/null | grep -q 'module\.s3_bucket_application\.aws_s3_bucket\.this\[0\]'; then
             STATE_HAS_BUCKETS="true"
           fi
 
@@ -578,29 +583,67 @@ jobs:
             EXISTING_BUCKETS="true"
           fi
 
-          SKIP_APPLY="false"
+          IMPORT_NEEDED="false"
           if [ "$EXISTING_BUCKETS" = "true" ] && [ "$STATE_HAS_BUCKETS" != "true" ]; then
-            SKIP_APPLY="true"
-            echo "Matching S3 buckets already exist outside Terraform state; apply will be skipped."
+            IMPORT_NEEDED="true"
+            echo "Matching S3 buckets exist, but the Terraform state is empty. Import will run before apply/destroy."
           fi
 
           echo "state_has_buckets=$STATE_HAS_BUCKETS" >> "$GITHUB_OUTPUT"
           echo "existing_buckets=$EXISTING_BUCKETS" >> "$GITHUB_OUTPUT"
-          echo "skip_apply=$SKIP_APPLY" >> "$GITHUB_OUTPUT"
+          echo "import_needed=$IMPORT_NEEDED" >> "$GITHUB_OUTPUT"
+
+      - name: Import Existing Buckets into Terraform State
+        if: ${{ steps.precheck.outputs.import_needed == 'true' }}
+        working-directory: examples/complete
+        shell: bash
+        run: |
+          INIT_ARGS=(
+            -reconfigure
+            "-backend-config=bucket=$TF_BACKEND_BUCKET"
+            "-backend-config=key=$TF_BACKEND_KEY"
+            "-backend-config=region=$TF_BACKEND_REGION"
+          )
+
+          if [ -n "$TF_BACKEND_LOCK_TABLE" ]; then
+            INIT_ARGS+=("-backend-config=dynamodb_table=$TF_BACKEND_LOCK_TABLE")
+          fi
+
+          terraform init "${INIT_ARGS[@]}"
+
+          if ! terraform state show 'module.s3_bucket_logs.aws_s3_bucket.this[0]' >/dev/null 2>&1; then
+            terraform import 'module.s3_bucket_logs.aws_s3_bucket.this[0]' '${{ steps.precheck.outputs.logs_bucket }}'
+          fi
+
+          if ! terraform state show 'module.s3_bucket_application.aws_s3_bucket.this[0]' >/dev/null 2>&1; then
+            terraform import 'module.s3_bucket_application.aws_s3_bucket.this[0]' '${{ steps.precheck.outputs.app_bucket }}'
+          fi
 
       - name: Terraform Apply or Destroy (Complete Example)
-        if: ${{ steps.resolve.outputs.operation == 'destroy' || steps.precheck.outputs.skip_apply != 'true' }}
         working-directory: examples/complete
         shell: bash
         run: |
           echo "Terraform action: ${{ steps.resolve.outputs.operation }}"
           echo "Bucket prefix: ${{ steps.resolve.outputs.bucket_prefix }}"
           echo "Environment: ${{ steps.resolve.outputs.deploy_environment }}"
-          echo "State key: ${{ steps.statekey.outputs.selected_key }}"
+          echo "State bucket: $TF_BACKEND_BUCKET"
+          echo "State key: $TF_BACKEND_KEY"
           echo "State source: ${{ steps.statekey.outputs.detection_source }}"
           echo "Force destroy: ${{ steps.resolve.outputs.force_destroy }}"
 
-          terraform init -reconfigure -backend-config=/tmp/backend.hcl
+          INIT_ARGS=(
+            -reconfigure
+            "-backend-config=bucket=$TF_BACKEND_BUCKET"
+            "-backend-config=key=$TF_BACKEND_KEY"
+            "-backend-config=region=$TF_BACKEND_REGION"
+          )
+
+          if [ -n "$TF_BACKEND_LOCK_TABLE" ]; then
+            INIT_ARGS+=("-backend-config=dynamodb_table=$TF_BACKEND_LOCK_TABLE")
+          fi
+
+          terraform init "${INIT_ARGS[@]}"
+          terraform state list || true
 
           if [ "${{ steps.resolve.outputs.operation }}" = "destroy" ]; then
             terraform destroy -auto-approve \
@@ -628,12 +671,25 @@ jobs:
           echo "- Force destroy: ${{ steps.resolve.outputs.force_destroy }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ steps.precheck.outputs.skip_apply }}" = "true" ]; then
-            echo "Apply skipped because matching S3 buckets already exist from a previous deployment outside the current Terraform state." >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ steps.resolve.outputs.operation }}" = "destroy" ]; then
+          if [ "${{ steps.precheck.outputs.import_needed }}" = "true" ]; then
+            echo "Existing S3 buckets were imported into Terraform state before the operation." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.resolve.outputs.operation }}" = "destroy" ]; then
             echo "Infrastructure destroy completed." >> $GITHUB_STEP_SUMMARY
           else
-            terraform init -reconfigure -backend-config=/tmp/backend.hcl >/dev/null
+            INIT_ARGS=(
+              -reconfigure
+              "-backend-config=bucket=$TF_BACKEND_BUCKET"
+              "-backend-config=key=$TF_BACKEND_KEY"
+              "-backend-config=region=$TF_BACKEND_REGION"
+            )
+
+            if [ -n "$TF_BACKEND_LOCK_TABLE" ]; then
+              INIT_ARGS+=("-backend-config=dynamodb_table=$TF_BACKEND_LOCK_TABLE")
+            fi
+
+            terraform init "${INIT_ARGS[@]}" >/dev/null
             terraform output >> $GITHUB_STEP_SUMMARY
           fi
 
